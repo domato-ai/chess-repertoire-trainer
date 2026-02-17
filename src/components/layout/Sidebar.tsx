@@ -1,3 +1,4 @@
+import { useMemo } from 'react';
 import { NavLink } from 'react-router-dom';
 import { useSRSStore } from '../../stores/useSRSStore';
 
@@ -10,7 +11,16 @@ const navItems = [
 ];
 
 export function Sidebar() {
-  const stats = useSRSStore(s => s.getStats());
+  const cards = useSRSStore(s => s.cards);
+
+  const { totalLines, dueToday } = useMemo(() => {
+    const allCards = Object.values(cards);
+    const now = Date.now();
+    return {
+      totalLines: allCards.length,
+      dueToday: allCards.filter(c => c.nextReviewDate <= now && c.totalReviews > 0).length,
+    };
+  }, [cards]);
 
   return (
     <aside className="w-56 bg-[var(--bg-secondary)] border-r border-[var(--border)] flex flex-col shrink-0">
@@ -34,9 +44,9 @@ export function Sidebar() {
           >
             <span className="text-base">{item.icon}</span>
             <span>{item.label}</span>
-            {item.path === '/drill' && stats.dueToday > 0 && (
+            {item.path === '/drill' && dueToday > 0 && (
               <span className="ml-auto text-xs bg-[var(--accent)] text-white px-1.5 py-0.5 rounded-full">
-                {stats.dueToday}
+                {dueToday}
               </span>
             )}
           </NavLink>
@@ -45,7 +55,7 @@ export function Sidebar() {
 
       <div className="p-3 border-t border-[var(--border)]">
         <div className="text-xs text-[var(--text-muted)]">
-          {stats.totalLines} lines · {stats.dueToday} due
+          {totalLines} lines · {dueToday} due
         </div>
       </div>
     </aside>

@@ -1,17 +1,45 @@
+import { useMemo } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Header } from '../components/layout/Header';
 import { useRepertoireStore } from '../stores/useRepertoireStore';
 import { useSRSStore } from '../stores/useSRSStore';
+import { SM2_DEFAULT_EASE_FACTOR } from '../data/constants';
 import { countLines } from '../utils/repertoire-tree';
 
 export function DashboardPage() {
   const repertoires = useRepertoireStore(s => s.repertoires);
   const lines = useRepertoireStore(s => s.lines);
-  const stats = useSRSStore(s => s.getStats());
-  const getDueCards = useSRSStore(s => s.getDueCards);
+  const cards = useSRSStore(s => s.cards);
   const navigate = useNavigate();
 
   const repList = Object.values(repertoires);
+
+  const stats = useMemo(() => {
+    const allCards = Object.values(cards);
+    const now = Date.now();
+    const dueToday = allCards.filter(c => c.nextReviewDate <= now && c.totalReviews > 0).length;
+    const newLines = allCards.filter(c => c.totalReviews === 0).length;
+    const totalReviews = allCards.reduce((sum, c) => sum + c.totalReviews, 0);
+    const totalCorrect = allCards.reduce((sum, c) => sum + c.correctCount, 0);
+    const averageEase = allCards.length > 0
+      ? allCards.reduce((sum, c) => sum + c.easeFactor, 0) / allCards.length
+      : SM2_DEFAULT_EASE_FACTOR;
+    return {
+      totalLines: allCards.length,
+      dueToday,
+      newLines,
+      averageEase: Math.round(averageEase * 100) / 100,
+      totalReviews,
+      accuracy: totalReviews > 0 ? Math.round((totalCorrect / totalReviews) * 100) : 0,
+    };
+  }, [cards]);
+
+  const getDueCountForRep = (repId: string) => {
+    const now = Date.now();
+    return Object.values(cards).filter(
+      c => c.repertoireId === repId && c.nextReviewDate <= now && c.totalReviews > 0
+    ).length;
+  };
 
   return (
     <div className="flex flex-col h-full">
@@ -61,7 +89,7 @@ export function DashboardPage() {
               <div className="grid grid-cols-2 gap-4">
                 {repList.map(rep => {
                   const repLines = lines[rep.id] || [];
-                  const dueCount = getDueCards(rep.id).length;
+                  const dueCount = getDueCountForRep(rep.id);
 
                   return (
                     <div

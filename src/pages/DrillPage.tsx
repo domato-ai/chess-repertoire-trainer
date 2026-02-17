@@ -17,8 +17,20 @@ import { STARTING_FEN } from '../types/repertoire';
 export function DrillPage() {
   const repertoires = useRepertoireStore(s => s.repertoires);
   const lines = useRepertoireStore(s => s.lines);
-  const drillStore = useDrillStore();
-  const srsStore = useSRSStore();
+  const srsCards = useSRSStore(s => s.cards);
+
+  // Select individual drill store fields to avoid infinite loops
+  const status = useDrillStore(s => s.status);
+  const currentLine = useDrillStore(s => s.currentLine);
+  const currentPlyIndex = useDrillStore(s => s.currentPlyIndex);
+  const userColor = useDrillStore(s => s.userColor);
+  const mistakeCount = useDrillStore(s => s.mistakeCount);
+  const hintsUsed = useDrillStore(s => s.hintsUsed);
+  const linesCompleted = useDrillStore(s => s.linesCompleted);
+  const linesRemaining = useDrillStore(s => s.linesRemaining);
+  const sessionResults = useDrillStore(s => s.sessionResults);
+  const startTime = useDrillStore(s => s.startTime);
+
   const autoPlayDelay = useSettingsStore(s => s.autoPlayDelay);
 
   const [boardFen, setBoardFen] = useState(STARTING_FEN);
@@ -28,18 +40,12 @@ export function DrillPage() {
   const [waitingForOpponent, setWaitingForOpponent] = useState(false);
   const timerRef = useRef<ReturnType<typeof setTimeout>>(null);
 
-  const { status, currentLine, currentPlyIndex, userColor, mistakeCount, hintsUsed,
-    linesCompleted, linesRemaining, sessionResults,
-    startSession, advancePly, setFeedback, addMistake, addHint,
-    completeLine, nextLine, reset: resetDrill } = drillStore;
-
   // Get the expected move SAN at the current ply
   const expectedSan = currentLine?.sanSequence[currentPlyIndex] || null;
 
   // Is it the user's turn?
   const isUserTurn = useMemo(() => {
     if (!currentLine) return false;
-    // White moves on even indices (0, 2, 4...), Black on odd (1, 3, 5...)
     const isWhiteTurn = currentPlyIndex % 2 === 0;
     return (userColor === 'white' && isWhiteTurn) || (userColor === 'black' && !isWhiteTurn);
   }, [currentPlyIndex, userColor, currentLine]);
@@ -50,30 +56,27 @@ export function DrillPage() {
 
     setWaitingForOpponent(true);
     timerRef.current = setTimeout(() => {
-      // Play the opponent's move
       const san = currentLine.sanSequence[currentPlyIndex];
       if (!san) return;
 
-      // Build the current position
       const chess = new Chess(STARTING_FEN);
       for (let i = 0; i < currentPlyIndex; i++) {
         chess.move(currentLine.sanSequence[i]);
       }
       chess.move(san);
       setBoardFen(chess.fen());
-      advancePly();
+      useDrillStore.getState().advancePly();
       setWaitingForOpponent(false);
 
-      // Check if line is complete
       if (currentPlyIndex + 1 >= currentLine.sanSequence.length) {
         const quality = deriveQuality(mistakeCount, hintsUsed);
-        completeLine({
+        useDrillStore.getState().completeLine({
           lineId: currentLine.id,
           timestamp: Date.now(),
           quality,
           mistakes: mistakeCount,
           hintsUsed,
-          timeSpentMs: Date.now() - (drillStore.startTime || Date.now()),
+          timeSpentMs: Date.now() - (startTime || Date.now()),
         });
       }
     }, autoPlayDelay);
@@ -81,25 +84,21 @@ export function DrillPage() {
     return () => {
       if (timerRef.current) clearTimeout(timerRef.current);
     };
-  }, [status, currentLine, currentPlyIndex, isUserTurn, waitingForOpponent, autoPlayDelay, advancePly, completeLine, mistakeCount, hintsUsed, drillStore.startTime]);
+  }, [status, currentLine, currentPlyIndex, isUserTurn, waitingForOpponent, autoPlayDelay, mistakeCount, hintsUsed, startTime]);
 
   // Handle user's move
   const handlePieceDrop = useCallback((source: Square, target: Square): boolean => {
     if (status !== 'playing' || !currentLine || !isUserTurn || !expectedSan) return false;
 
-    // Build current position
     const chess = new Chess(STARTING_FEN);
     for (let i = 0; i < currentPlyIndex; i++) {
       chess.move(currentLine.sanSequence[i]);
     }
 
-    // Validate the move
     try {
       const move = chess.move({ from: source, to: target, promotion: 'q' });
       if (!move) return false;
 
-      // Check if the move matches any expected move
-      // Look up the current node in the repertoire to check all variations
       const repId = currentLine.repertoireId;
       const rep = repertoires[repId];
       let acceptedMoves: string[] = [expectedSan];
@@ -115,42 +114,38 @@ export function DrillPage() {
       }
 
       if (acceptedMoves.includes(move.san)) {
-        // Correct move!
         setSquareStyles({
           [target]: { backgroundColor: 'rgba(74, 222, 128, 0.5)' },
         });
-        setFeedback('correct');
+        useDrillStore.getState().setFeedback('correct');
         setBoardFen(chess.fen());
-        advancePly();
+        useDrillStore.getState().advancePly();
 
         setTimeout(() => {
           setSquareStyles({});
-          setFeedback(null);
+          useDrillStore.getState().setFeedback(null);
 
-          // Check if line is complete
           if (currentPlyIndex + 1 >= currentLine.sanSequence.length) {
             const quality = deriveQuality(mistakeCount, hintsUsed);
-            completeLine({
+            useDrillStore.getState().completeLine({
               lineId: currentLine.id,
               timestamp: Date.now(),
               quality,
               mistakes: mistakeCount,
               hintsUsed,
-              timeSpentMs: Date.now() - (drillStore.startTime || Date.now()),
+              timeSpentMs: Date.now() - (startTime || Date.now()),
             });
           }
         }, FEEDBACK_DURATION_CORRECT);
 
         return true;
       } else {
-        // Wrong move!
         setSquareStyles({
           [target]: { backgroundColor: 'rgba(248, 113, 113, 0.5)' },
         });
-        setFeedback('incorrect');
-        addMistake();
+        useDrillStore.getState().setFeedback('incorrect');
+        useDrillStore.getState().addMistake();
 
-        // Show the correct move as an arrow
         const correctChess = new Chess(STARTING_FEN);
         for (let i = 0; i < currentPlyIndex; i++) {
           correctChess.move(currentLine.sanSequence[i]);
@@ -160,9 +155,7 @@ export function DrillPage() {
           setArrows([{ from: correctMove.from, to: correctMove.to, color: '#4ade80' }]);
         }
 
-        // Revert after delay
         setTimeout(() => {
-          // Rebuild the position before the wrong move
           const revertChess = new Chess(STARTING_FEN);
           for (let i = 0; i < currentPlyIndex; i++) {
             revertChess.move(currentLine.sanSequence[i]);
@@ -170,7 +163,7 @@ export function DrillPage() {
           setBoardFen(revertChess.fen());
           setSquareStyles({});
           setArrows([]);
-          setFeedback(null);
+          useDrillStore.getState().setFeedback(null);
         }, FEEDBACK_DURATION_INCORRECT);
 
         return false;
@@ -178,7 +171,7 @@ export function DrillPage() {
     } catch {
       return false;
     }
-  }, [status, currentLine, currentPlyIndex, isUserTurn, expectedSan, repertoires, addMistake, advancePly, completeLine, drillStore.startTime, hintsUsed, mistakeCount, setFeedback]);
+  }, [status, currentLine, currentPlyIndex, isUserTurn, expectedSan, repertoires, startTime, hintsUsed, mistakeCount]);
 
   // Handle hint
   const handleHint = useCallback(() => {
@@ -191,54 +184,45 @@ export function DrillPage() {
     const hintMove = chess.move(expectedSan);
     if (hintMove) {
       if (hintsUsed % 2 === 0) {
-        // First hint: highlight source square
         setSquareStyles({
           [hintMove.from]: { backgroundColor: 'rgba(251, 191, 36, 0.4)' },
         });
       } else {
-        // Second hint: show arrow
         setArrows([{ from: hintMove.from, to: hintMove.to, color: '#fbbf24' }]);
       }
-      addHint();
+      useDrillStore.getState().addHint();
     }
-    chess.undo(); // Revert the hint move
-  }, [currentLine, expectedSan, currentPlyIndex, hintsUsed, addHint]);
+    chess.undo();
+  }, [currentLine, expectedSan, currentPlyIndex, hintsUsed]);
 
   // Handle difficulty rating
   const handleRate = useCallback((quality: number) => {
     if (!currentLine) return;
 
-    // Update the last session result with the user's chosen quality
     const lastResult = sessionResults[sessionResults.length - 1];
     if (lastResult) {
-      srsStore.processReview({ ...lastResult, quality });
+      useSRSStore.getState().processReview({ ...lastResult, quality });
     }
 
-    // Next line
-    nextLine();
-    if (drillStore.linesRemaining.length > 0 || drillStore.status === 'complete') {
-      // Set up next line's board
-      const next = drillStore.currentLine;
-      if (next) {
-        setBoardFen(STARTING_FEN);
-        setSquareStyles({});
-        setArrows([]);
-      }
-    }
-  }, [currentLine, sessionResults, srsStore, nextLine, drillStore]);
+    useDrillStore.getState().nextLine();
+
+    setBoardFen(STARTING_FEN);
+    setSquareStyles({});
+    setArrows([]);
+  }, [currentLine, sessionResults]);
 
   // Handle skip
   const handleSkip = useCallback(() => {
     if (!currentLine || status !== 'playing') return;
-    completeLine({
+    useDrillStore.getState().completeLine({
       lineId: currentLine.id,
       timestamp: Date.now(),
       quality: 0,
       mistakes: mistakeCount + 3,
       hintsUsed,
-      timeSpentMs: Date.now() - (drillStore.startTime || Date.now()),
+      timeSpentMs: Date.now() - (startTime || Date.now()),
     });
-  }, [currentLine, status, completeLine, mistakeCount, hintsUsed, drillStore.startTime]);
+  }, [currentLine, status, mistakeCount, hintsUsed, startTime]);
 
   useKeyboardShortcuts({
     onHint: handleHint,
@@ -251,29 +235,32 @@ export function DrillPage() {
     if (!rep) return;
 
     const repLines = lines[repId] || [];
-    const dueCards = srsStore.getDueCards(repId);
-    const newCards = srsStore.getNewCards(repId);
+    const now = Date.now();
+    const allCards = Object.values(srsCards);
+    const dueCardIds = allCards
+      .filter(c => c.repertoireId === repId && c.nextReviewDate <= now && c.totalReviews > 0)
+      .map(c => c.lineId);
+    const newCardIds = allCards
+      .filter(c => c.repertoireId === repId && c.totalReviews === 0)
+      .slice(0, 10)
+      .map(c => c.lineId);
 
-    // Get lines to drill: due + new (up to limit)
     let drillLineIds: string[];
     if (lineIds && lineIds.length > 0) {
       drillLineIds = lineIds;
     } else {
-      const dueLineIds = dueCards.map(c => c.lineId);
-      const newLineIds = newCards.slice(0, 10).map(c => c.lineId);
-      drillLineIds = [...dueLineIds, ...newLineIds];
+      drillLineIds = [...dueCardIds, ...newCardIds];
     }
 
     const drillLines = repLines.filter(l => drillLineIds.includes(l.id));
     if (drillLines.length === 0) {
-      // If no specific lines, just drill all
-      startSession(
+      useDrillStore.getState().startSession(
         { repertoireId: repId, lineIds: [], shuffleOrder: true, showHints: true, maxLines: 20 },
         repLines.slice(0, 20),
         rep.color,
       );
     } else {
-      startSession(
+      useDrillStore.getState().startSession(
         { repertoireId: repId, lineIds: drillLineIds, shuffleOrder: true, showHints: true, maxLines: 0 },
         drillLines,
         rep.color,
@@ -284,10 +271,13 @@ export function DrillPage() {
     setBoardFen(STARTING_FEN);
     setSquareStyles({});
     setArrows([]);
-  }, [repertoires, lines, srsStore, startSession]);
+  }, [repertoires, lines, srsCards]);
 
   // Render based on drill status
   if (status === 'idle' || status === 'selecting') {
+    const now = Date.now();
+    const allCards = Object.values(srsCards);
+
     return (
       <div className="flex flex-col h-full">
         <Header title="Drill" subtitle="Practice your opening lines" />
@@ -296,8 +286,8 @@ export function DrillPage() {
             <h3 className="text-lg font-medium">Select a repertoire to drill</h3>
             {Object.values(repertoires).map(rep => {
               const repLines = lines[rep.id] || [];
-              const dueCount = srsStore.getDueCards(rep.id).length;
-              const newCount = srsStore.getNewCards(rep.id).length;
+              const dueCount = allCards.filter(c => c.repertoireId === rep.id && c.nextReviewDate <= now && c.totalReviews > 0).length;
+              const newCount = allCards.filter(c => c.repertoireId === rep.id && c.totalReviews === 0).length;
 
               return (
                 <div
@@ -370,7 +360,7 @@ export function DrillPage() {
               </div>
             </div>
             <button
-              onClick={resetDrill}
+              onClick={() => useDrillStore.getState().reset()}
               className="px-6 py-2.5 rounded bg-[var(--accent)] text-white hover:bg-[var(--accent-hover)]"
             >
               Back to Drill Selection
