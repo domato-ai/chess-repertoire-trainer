@@ -40,8 +40,6 @@ export function splitPGN(pgnText: string): string[] {
  * - Preserves [%cal ...] and [%csl ...] annotations
  */
 function preprocessPGN(pgn: string): string {
-  // Remove Z0 null moves - they appear as "Z0" in the PGN
-  // Z0 followed by continuations in the same variation should be stripped
   let processed = pgn;
 
   // Remove [%evp ...] annotations
@@ -53,10 +51,8 @@ function preprocessPGN(pgn: string): string {
   // Remove [#] markers
   processed = processed.replace(/\[#\]/g, '');
 
-  // Handle Z0 null moves: remove "Z0" and any subsequent moves in the same line
-  // Z0 typically appears in sequences like "Z0 6. Nc3 Z0 7. f4"
-  // We need to strip these entire sequences
-  processed = processed.replace(/\bZ0\b/g, '');
+  // Keep Z0 null moves as-is — they'll be handled during parsing
+  // by skipping the rest of the variation when encountered
 
   // Clean up double spaces and empty comments
   processed = processed.replace(/\{[\s]*\}/g, '');
@@ -106,8 +102,9 @@ function extractAnnotations(comment: string): {
 
 /**
  * Parse a single PGN game into a RepertoireTree.
- * Uses chess.js for move validation and FEN generation,
- * with custom recursive descent parser for variations (RAV).
+ * Uses a stack-based recursive descent parser for variations (RAV).
+ * Each scope (main line + each variation) gets its own Chess instance
+ * to avoid history corruption from chess.load().
  */
 export function parseGame(pgnText: string): ParsedGame {
   // Extract headers
@@ -134,9 +131,9 @@ export function parseGame(pgnText: string): ParsedGame {
   };
 
   const tokens = tokenize(preprocessed);
-  const chess = new Chess();
+  const pos = { idx: 0 };
 
-  parseTokens(tokens, chess, tree.children, null, 0, openingName);
+  parseMoves(tokens, pos, STARTING_FEN, tree.children, null, 0, openingName, true);
 
   const moveCount = countNodesInTree(tree.children);
   const lineCount = countLeavesInTree(tree.children);
@@ -164,6 +161,7 @@ type Token =
   | { type: 'comment'; value: string }
   | { type: 'openParen' }
   | { type: 'closeParen' }
+  | { type: 'nullMove' }
   | { type: 'result'; value: string };
 
 function tokenize(movetext: string): Token[] {
@@ -234,6 +232,13 @@ function tokenize(movetext: string): Token[] {
       continue;
     }
 
+    // Null move (ChessMood Z0 placeholder)
+    if (text.substring(i, i + 2) === 'Z0') {
+      tokens.push({ type: 'nullMove' });
+      i += 2;
+      continue;
+    }
+
     // SAN move (e.g., "e4", "Nf3", "O-O", "O-O-O", "Qxd4+", "exd5")
     const sanMatch = text.substring(i).match(/^([KQRBNP]?[a-h]?[1-8]?x?[a-h][1-8](?:=[QRBN])?[+#]?|O-O-O|O-O)[+#]?/);
     if (sanMatch) {
@@ -250,27 +255,74 @@ function tokenize(movetext: string): Token[] {
 }
 
 /**
- * Recursively parse tokens into MoveNode children.
+ * Skip remaining tokens in the current scope after a Z0 null move.
+ * Properly handles nested parentheses so the parent scope isn't confused.
+ * For a variation scope, consumes up to and including the matching ')'.
+ * For the main scope, just skips everything.
  */
-function parseTokens(
+function skipRemainingMoves(tokens: Token[], pos: { idx: number }, isMainScope: boolean): void {
+  let depth = 0;
+  while (pos.idx < tokens.length) {
+    const t = tokens[pos.idx];
+    if (t.type === 'openParen') {
+      depth++;
+      pos.idx++;
+    } else if (t.type === 'closeParen') {
+      if (depth === 0) {
+        // This closes our scope (variation)
+        if (!isMainScope) {
+          pos.idx++;
+        }
+        return;
+      }
+      depth--;
+      pos.idx++;
+    } else {
+      pos.idx++;
+    }
+  }
+}
+
+/**
+ * Core recursive parser. Each invocation handles one "scope" — either the
+ * main line or a single variation delimited by parentheses.
+ *
+ * Key design: each scope creates its own Chess instance from `startFen`,
+ * so we never need chess.load() which destroys history.
+ *
+ * @param tokens     - Full token array (shared, navigated via pos.idx)
+ * @param pos        - Mutable position pointer into tokens
+ * @param startFen   - FEN of the position before the first move in this scope
+ * @param siblings   - The array to push first-moves into (e.g. tree.children or parentNode.children)
+ * @param parentId   - ID of the parent node (null for root level)
+ * @param plyOffset  - Ply count at startFen (for correct moveNumber calculation)
+ * @param openingName - Opening name from PGN header
+ * @param isMainScope - Whether this is the top-level (non-variation) scope
+ */
+function parseMoves(
   tokens: Token[],
-  chess: Chess,
-  children: MoveNode[],
+  pos: { idx: number },
+  startFen: string,
+  siblings: MoveNode[],
   parentId: string | null,
-  _plyOffset: number,
+  plyOffset: number,
   openingName: string,
-  pos: { idx: number } = { idx: 0 },
+  isMainScope: boolean,
 ): void {
-  let pendingNags: number[] = [];
+  const chess = new Chess(startFen);
   let lastNode: MoveNode | null = null;
+  let ply = plyOffset;
+  let pendingNags: number[] = [];
 
   while (pos.idx < tokens.length) {
     const token = tokens[pos.idx];
 
     if (token.type === 'closeParen') {
-      // End of variation
-      pos.idx++;
-      break;
+      // End of this variation scope — consume the token only if we're a variation
+      if (!isMainScope) {
+        pos.idx++;
+      }
+      return;
     }
 
     if (token.type === 'result') {
@@ -285,144 +337,6 @@ function parseTokens(
 
     if (token.type === 'comment') {
       if (lastNode) {
-        // Attach comment to the last move
-        const { arrows, highlights, cleanComment } = extractAnnotations(token.value);
-        if (cleanComment) {
-          lastNode.comment = lastNode.comment
-            ? lastNode.comment + ' ' + cleanComment
-            : cleanComment;
-        }
-        lastNode.arrows.push(...arrows);
-        lastNode.highlights.push(...highlights);
-      } else {
-        // Comment before first move — store as pending
-        // TODO: use pending comment for root node annotation
-      }
-      pos.idx++;
-      continue;
-    }
-
-    if (token.type === 'nag') {
-      if (lastNode) {
-        lastNode.nags.push(token.value);
-      } else {
-        pendingNags.push(token.value);
-      }
-      pos.idx++;
-      continue;
-    }
-
-    if (token.type === 'move') {
-      // Try to make the move
-      const result = chess.move(token.value);
-      if (!result) {
-        // Invalid move — skip
-        pos.idx++;
-        continue;
-      }
-
-      const currentPly = chess.history().length;
-      const moveNumber = Math.ceil(currentPly / 2);
-
-      const node: MoveNode = {
-        id: generateId(),
-        san: result.san,
-        fen: chess.fen(),
-        parentId,
-        children: [],
-        comment: '',
-        arrows: [],
-        highlights: [],
-        nags: pendingNags.length > 0 ? [...pendingNags] : [],
-        isMainline: children.length === 0 && !lastNode,
-        moveNumber,
-        plyFromRoot: currentPly,
-        openingName: children.length === 0 && !lastNode ? openingName : '',
-      };
-
-      pendingNags = [];
-
-      if (lastNode) {
-        // This move follows the previous — add as child of last node
-        lastNode.children.push(node);
-        node.parentId = lastNode.id;
-        node.isMainline = lastNode.children.length === 1;
-        lastNode = node;
-      } else {
-        // First move at this level
-        children.push(node);
-        node.isMainline = children.length === 1;
-        lastNode = node;
-      }
-
-      pos.idx++;
-      continue;
-    }
-
-    if (token.type === 'openParen') {
-      // Start a variation — we need to back up to the position before the last move
-      // The variation is an alternative to the last move played
-      pos.idx++;
-
-      if (lastNode) {
-        // Undo the last move to get the position before it
-        const savedFen = chess.fen();
-        chess.undo();
-
-        // Find where to attach this variation
-        const variationParent = lastNode.parentId;
-        const parentNode = variationParent ? findNodeById(children, variationParent) : null;
-        const siblingList = parentNode ? parentNode.children : children;
-
-        // Create a temporary chess instance for this variation
-        const variationChess = new Chess(chess.fen());
-
-        const variationChildren: MoveNode[] = [];
-        // Parse the variation
-        parseVariation(tokens, variationChess, variationChildren, variationParent, openingName, pos);
-
-        // Add variation moves as siblings
-        for (const varChild of variationChildren) {
-          varChild.isMainline = false;
-          siblingList.push(varChild);
-        }
-
-        // Restore position
-        chess.load(savedFen);
-      }
-      continue;
-    }
-
-    pos.idx++;
-  }
-}
-
-function parseVariation(
-  tokens: Token[],
-  chess: Chess,
-  children: MoveNode[],
-  parentId: string | null,
-  openingName: string,
-  pos: { idx: number },
-): void {
-  let lastNode: MoveNode | null = null;
-  let pendingNags: number[] = [];
-
-  while (pos.idx < tokens.length) {
-    const token = tokens[pos.idx];
-
-    if (token.type === 'closeParen') {
-      pos.idx++;
-      break;
-    }
-
-    if (token.type === 'result' || token.type === 'moveNumber') {
-      pos.idx++;
-      continue;
-    }
-
-    if (token.type === 'comment') {
-      if (lastNode) {
         const { arrows, highlights, cleanComment } = extractAnnotations(token.value);
         if (cleanComment) {
           lastNode.comment = lastNode.comment
@@ -446,15 +360,26 @@ function parseVariation(
       continue;
     }
 
+    if (token.type === 'nullMove') {
+      // Z0 null move — skip all remaining moves in this scope.
+      // But we still need to handle nested variations correctly
+      // (consume matching parens so the parent scope isn't confused).
+      pos.idx++;
+      skipRemainingMoves(tokens, pos, isMainScope);
+      return;
+    }
+
     if (token.type === 'move') {
       const result = chess.move(token.value);
       if (!result) {
+        // Invalid move — skip it
+        console.warn(`Invalid move "${token.value}" at position ${chess.fen()}`);
         pos.idx++;
         continue;
       }
 
-      const currentPly = chess.history().length;
-      const moveNumber = Math.ceil(currentPly / 2);
+      ply++;
+      const moveNumber = Math.ceil(ply / 2);
 
       const node: MoveNode = {
         id: generateId(),
@@ -468,17 +393,25 @@ function parseVariation(
         nags: pendingNags.length > 0 ? [...pendingNags] : [],
         isMainline: false,
         moveNumber,
-        plyFromRoot: currentPly,
+        plyFromRoot: ply,
         openingName: '',
       };
-
       pendingNags = [];
 
       if (lastNode) {
+        // Continuation — child of previous move
+        node.isMainline = lastNode.children.length === 0;
+        if (!node.isMainline) {
+          node.openingName = '';
+        }
         lastNode.children.push(node);
-        node.isMainline = lastNode.children.length === 1;
       } else {
-        children.push(node);
+        // First move in this scope
+        node.isMainline = siblings.length === 0;
+        if (node.isMainline && isMainScope) {
+          node.openingName = openingName;
+        }
+        siblings.push(node);
       }
 
       lastNode = node;
@@ -487,34 +420,60 @@ function parseVariation(
     }
 
     if (token.type === 'openParen') {
-      pos.idx++;
+      // A variation branches off as an alternative to `lastNode`.
+      // The variation starts from the position BEFORE lastNode's move was played.
+      pos.idx++; // consume '('
 
       if (lastNode) {
-        const savedFen = chess.fen();
-        chess.undo();
+        // FEN before lastNode's move = the position where the parent was,
+        // which is the FEN of the parent node, or startFen if lastNode is the first move.
+        const branchFen = lastNode.parentId
+          ? getFenForParent(lastNode, siblings, startFen)
+          : startFen;
 
-        const subVariationChildren: MoveNode[] = [];
-        const subChess = new Chess(chess.fen());
-        parseVariation(tokens, subChess, subVariationChildren, lastNode.parentId, openingName, pos);
-
-        // Find where to attach - as siblings of lastNode
-        const attachParent = lastNode.parentId
-          ? findNodeById(children, lastNode.parentId)
+        // The variation's first move becomes a sibling of lastNode.
+        // If lastNode has a parent, the sibling list is that parent's children.
+        // If lastNode is a first move in this scope, the sibling list is `siblings`.
+        const parentNode = lastNode.parentId
+          ? findNodeById(siblings, lastNode.parentId)
           : null;
-        const siblingList = attachParent ? attachParent.children : children;
+        const siblingList = parentNode ? parentNode.children : siblings;
 
-        for (const varChild of subVariationChildren) {
-          varChild.isMainline = false;
-          siblingList.push(varChild);
-        }
+        // Ply before lastNode was played
+        const branchPly = lastNode.plyFromRoot - 1;
 
-        chess.load(savedFen);
+        parseMoves(
+          tokens, pos, branchFen, siblingList,
+          lastNode.parentId, branchPly, openingName, false,
+        );
+      } else {
+        // Variation before any move in this scope — unusual but possible.
+        // Just parse it into the siblings array from startFen.
+        parseMoves(
+          tokens, pos, startFen, siblings,
+          parentId, plyOffset, openingName, false,
+        );
       }
       continue;
     }
 
+    // Unknown token — skip
     pos.idx++;
   }
+}
+
+/**
+ * Get the FEN for the parent of a node by searching the tree.
+ * Returns startFen if the parent is the root.
+ */
+function getFenForParent(
+  node: MoveNode,
+  rootChildren: MoveNode[],
+  startFen: string,
+): string {
+  if (!node.parentId) return startFen;
+  const parent = findNodeById(rootChildren, node.parentId);
+  return parent ? parent.fen : startFen;
 }
 
 function findNodeById(nodes: MoveNode[], id: string): MoveNode | null {
